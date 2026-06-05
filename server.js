@@ -5,8 +5,7 @@ const { Server } = require('socket.io');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const low = require('lowdb');
-const FileSync = require('lowdb/adapters/FileSync');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 const server = http.createServer(app);
@@ -16,9 +15,17 @@ const PORT = process.env.PORT || 3000;
 if (!fs.existsSync('public')) fs.mkdirSync('public');
 if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 
-const adapter = new FileSync('db.json');
-const db = low(adapter);
-db.defaults({ users: [], messages: [] }).write();
+const MONGODB_URI = process.env.MONGODB_URI;
+let db;
+
+MongoClient.connect(MONGODB_URI).then(client => {
+  db = client.db('rateme');
+  console.log('MongoDB подключён');
+  server.listen(PORT, () => console.log('RateMe запущен на порту ' + PORT));
+}).catch(err => {
+  console.error('Ошибка подключения к MongoDB:', err);
+  process.exit(1);
+});
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, 'uploads/'),
@@ -44,12 +51,13 @@ app.post('/api/register', upload.single('photo'), async (req, res) => {
     const { name, pass, gender } = req.body;
     if (!name || !pass || !gender) return res.json({ ok: false, error: 'Заполни все поля' });
     if (pass.length < 4) return res.json({ ok: false, error: 'Пароль минимум 4 символа' });
-    if (db.get('users').find({ name }).value()) return res.json({ ok: false, error: 'Ник уже занят' });
+    const existing = await db.collection('users').findOne({ name });
+    if (existing) return res.json({ ok: false, error: 'Ник уже занят' });
     const hash = await bcrypt.hash(pass, 10);
     const photo = req.file ? '/uploads/' + req.file.filename : null;
     const user = { id: Date.now(), name, pass: hash, gender, photo, elo: 1000, wins: 0, losses: 0, joined: Date.now() };
-    db.get('users').push(user).write();
-    const { pass: _, ...safeUser } = user;
+    await db.collection('users').insertOne(user);
+    const { pass: _, _id, ...safeUser } = user;
     res.json({ ok: true, user: safeUser });
   } catch (e) {
     res.json({ ok: false, error: 'Ошибка сервера' });
@@ -58,71 +66,70 @@ app.post('/api/register', upload.single('photo'), async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
   const { name, pass } = req.body;
-  const user = db.get('users').find({ name }).value();
+  const user = await db.collection('users').findOne({ name });
   if (!user) return res.json({ ok: false, error: 'Неверное имя или пароль' });
   const ok = await bcrypt.compare(pass, user.pass);
   if (!ok) return res.json({ ok: false, error: 'Неверное имя или пароль' });
-  const { pass: _, ...safeUser } = user;
+  const { pass: _, _id, ...safeUser } = user;
   res.json({ ok: true, user: safeUser });
 });
 
-app.get('/api/users', (req, res) => {
-  const users = db.get('users').map(u => {
-    const { pass, ...safe } = u; return safe;
-  }).value();
+app.get('/api/users', async (req, res) => {
+  const users = await db.collection('users').find({}, { projection: { pass: 0, _id: 0 } }).toArray();
   res.json(users);
 });
 
-app.post('/api/vote', (req, res) => {
+app.post('/api/vote', async (req, res) => {
   const { winnerName, loserName } = req.body;
-  const winner = db.get('users').find({ name: winnerName }).value();
-  const loser = db.get('users').find({ name: loserName }).value();
+  const winner = await db.collection('users').findOne({ name: winnerName });
+  const loser = await db.collection('users').findOne({ name: loserName });
   if (!winner || !loser) return res.json({ ok: false });
   const [newW, newL] = eloUpdate(winner.elo, loser.elo);
-  db.get('users').find({ name: winnerName }).assign({ elo: newW, wins: winner.wins + 1 }).write();
-  db.get('users').find({ name: loserName }).assign({ elo: newL, losses: loser.losses + 1 }).write();
+  await db.collection('users').updateOne({ name: winnerName }, { $set: { elo: newW, wins: winner.wins + 1 } });
+  await db.collection('users').updateOne({ name: loserName }, { $set: { elo: newL, losses: loser.losses + 1 } });
   io.emit('vote_update');
   res.json({ ok: true });
 });
 
-app.post('/api/photo', upload.single('photo'), (req, res) => {
+app.post('/api/photo', upload.single('photo'), async (req, res) => {
   const { name } = req.body;
   if (!req.file || !name) return res.json({ ok: false });
   const photo = '/uploads/' + req.file.filename;
-  db.get('users').find({ name }).assign({ photo }).write();
+  await db.collection('users').updateOne({ name }, { $set: { photo } });
   res.json({ ok: true, photo });
 });
 
-app.delete('/api/user/:name', (req, res) => {
-  db.get('users').remove({ name: req.params.name }).write();
+app.delete('/api/user/:name', async (req, res) => {
+  await db.collection('users').deleteOne({ name: req.params.name });
   res.json({ ok: true });
 });
 
-app.get('/api/messages/:user1/:user2', (req, res) => {
+app.get('/api/messages/:user1/:user2', async (req, res) => {
   const { user1, user2 } = req.params;
-  const msgs = db.get('messages').filter(m =>
-    (m.from === user1 && m.to === user2) || (m.from === user2 && m.to === user1)
-  ).value();
-  db.get('messages').filter({ to: user1, from: user2 }).each(m => m.read = true).write();
-  res.json(msgs);
+  const msgs = await db.collection('messages').find({
+    $or: [
+      { from: user1, to: user2 },
+      { from: user2, to: user1 }
+    ]
+  }).toArray();
+  await db.collection('messages').updateMany({ to: user1, from: user2 }, { $set: { read: true } });
+  res.json(msgs.map(({ _id, ...m }) => m));
 });
 
-app.post('/api/messages', (req, res) => {
+app.post('/api/messages', async (req, res) => {
   const { from, to, text } = req.body;
   if (!from || !to || !text) return res.json({ ok: false });
   const msg = { id: Date.now(), from, to, text, ts: Date.now(), read: false };
-  db.get('messages').push(msg).write();
+  await db.collection('messages').insertOne(msg);
   io.to(to).emit('new_message', { from, text, ts: msg.ts });
   res.json({ ok: true });
 });
 
-app.get('/api/unread/:user', (req, res) => {
-  const count = db.get('messages').filter({ to: req.params.user, read: false }).size().value();
+app.get('/api/unread/:user', async (req, res) => {
+  const count = await db.collection('messages').countDocuments({ to: req.params.user, read: false });
   res.json({ count });
 });
 
 io.on('connection', (socket) => {
   socket.on('join', (username) => socket.join(username));
 });
-
-server.listen(PORT, () => console.log('RateMe запущен на порту ' + PORT));
